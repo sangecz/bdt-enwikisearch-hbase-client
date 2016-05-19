@@ -2,7 +2,6 @@ package cz.cvut.bdt;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
-import java.nio.ByteBuffer;
 import java.util.*;
 
 import org.hbase.async.Config;
@@ -19,9 +18,9 @@ final class Example {
 	private static HashMap<String, Long> numWordsInDoc;
 	private static int N;
 	private static long avdl;
-    public static final double K = 1.75; // <1.2; 2.0>
+    public static final double K = 1.87; // <1.2; 2.0>
     public static final double B = 0.75;
-    public static final int PRINT_DOCS_NUM = 10;
+    public static final int PRINT_DOCS_NUM = 9;
     public static final String WIKI_ARTICLE_URL_PREFIX = "https://en.wikipedia.org/?curid=";
 
 	public static void main(final String[] args) throws Exception {
@@ -43,6 +42,12 @@ final class Example {
 		//-- SET java.security.auth.login.config --//
 		System.setProperty("java.security.auth.login.config",auth_conf);
 
+		System.out.println("async_conf=" + async_conf);
+		System.out.println("auth_conf=" + auth_conf);
+		System.out.println("table=" + table);
+		System.out.println("vocab=" + vocab);
+		System.out.println("docinfo=" + docinfo);
+
 		readVocab(vocab);
 		readDocInfo(docinfo);
 
@@ -52,16 +57,24 @@ final class Example {
 
 		String queryStr;
 		while ((queryStr = readQuery()) != null) {
-			query(table, client, queryStr);
+			System.out.println("You've entered '" + queryStr + "'");
+			List<Map.Entry<String, Double>> scores = query(table, client, queryStr);
+			printSearchHits(scores);
 		}
+
+		client.shutdown();
 
 		System.out.println("Bye!");
 	}
 
 	private static String readQuery() {
 		Scanner scanner = new Scanner(System.in);
-		System.out.print("Enter query (words space separated) or "+CHAR_TO_EXIT+" to exit: ");
-		String readLine = scanner.next();
+
+		String readLine = "";
+		while (readLine.isEmpty()) {
+			System.out.print("Enter query (words space separated) or " + CHAR_TO_EXIT + " to exit: ");
+			readLine = scanner.nextLine();
+		}
 
 		if(CHAR_TO_EXIT.equals(readLine.trim().toUpperCase())) {
 			return null;
@@ -69,19 +82,24 @@ final class Example {
 		return readLine;
 	}
 
-	private static void query(String table, HBaseClient client, String query) {
+	private static List<Map.Entry<String, Double>> query(String table, HBaseClient client, String query) {
 		String [] query_terms = query.split(WHITESPACE_PATTERN);
 
-        HashMap<String, Integer> doc_ids_tfs = new HashMap<>();
+        HashMap<DocIdQueryTerm, Integer> doc_ids_tfs = new HashMap<>();
         HashMap<String, Integer> n_query = new HashMap<>();
 
 		for (String query_term : query_terms) {
 			String row_key = vocabulary.get(query_term);
+
+			if(row_key == null) {
+				System.out.println("No article found.");
+				break;
+			}
+
 			GetRequest get = new GetRequest(table, row_key);
 
 			try {
 				ArrayList<KeyValue> result = client.get(get).joinUninterruptibly();
-//				System.out.println("Results for key " + row_key + " in table " + table);
 
                 n_query.put(query_term, result.size());
 
@@ -91,25 +109,20 @@ final class Example {
 					String doc_id = new String(res.qualifier());    //	StandardCharsets.UTF_8
 
 					// load tf (integer)
-					ByteBuffer bb = ByteBuffer.wrap(res.value());
-					int tf = bb.getInt();
-
+					int tf = Integer.parseInt(new String(res.value()));
 					// print
 //					System.out.println(doc_id + " : " + tf);
 
-					doc_ids_tfs.put(doc_id, tf);
+					doc_ids_tfs.put(new DocIdQueryTerm(doc_id, query_term), tf);
 				}
 
 			} catch (Exception e) {
-				System.out.println("Get failed:");
+				System.err.println("Get failed:");
 				e.printStackTrace();
 			}
 		}
 
-		client.shutdown();
-
-        List<Map.Entry<String, Double>> scores = countBM25(doc_ids_tfs, query_terms, n_query);
-        printSearchHits(scores);
+        return countBM25(doc_ids_tfs, query_terms, n_query);
 	}
 
     private static void printSearchHits(List<Map.Entry<String, Double>> scores) {
@@ -119,7 +132,7 @@ final class Example {
             String doc_id = entry.getKey();
 
             String url = WIKI_ARTICLE_URL_PREFIX + doc_id;
-            System.out.println("[" + (printedCnt + 1) + ".]\t" + url);
+            System.out.println("[" + (printedCnt + 1) + ".]\t" + url + "\t\tscore=" + entry.getValue());
 
             if(printedCnt++ >= PRINT_DOCS_NUM) {
                 break;
@@ -127,16 +140,21 @@ final class Example {
         }
     }
 
-    private static List<Map.Entry<String, Double>> countBM25(HashMap<String, Integer> doc_ids_tfs, String [] query_terms, HashMap<String, Integer> n_query) {
+    private static List<Map.Entry<String, Double>> countBM25(HashMap<DocIdQueryTerm, Integer> doc_ids_tfs, String [] query_terms, HashMap<String, Integer> n_query) {
 
         HashMap<String, Double> scores = new HashMap<>();
 
         // score (D, Q):
-        for (String doc_id : doc_ids_tfs.keySet()) {
-            long tf = doc_ids_tfs.get(doc_id);
+        for (Map.Entry<DocIdQueryTerm, Integer> entry : doc_ids_tfs.entrySet()) {
+			DocIdQueryTerm docId_queryTerm = entry.getKey();
+			String currentQueryTerm = docId_queryTerm.getQueryTerm();
+			String doc_id = docId_queryTerm.getDocId();
+			long tf = entry.getValue();
             double score = 0;
 
             for (String query_term : query_terms) {
+				if(!currentQueryTerm.equals(query_term)) continue;
+
                 double idf = getIDF(query_term, n_query);
                 score += idf * (tf  * (K + 1) / ( tf + K * (1 - B + B * (numWordsInDoc.get(doc_id) / avdl)) ) );
             }
@@ -161,25 +179,31 @@ final class Example {
     private static void readDocInfo(String filename) {
 
         numWordsInDoc = new HashMap<>();
+		System.out.println("Reading docinfo...");
 		try
 		{
 			BufferedReader reader = new BufferedReader(new FileReader(filename));
 			String line;
-			long globalNumWords = 0;
+			long sumWords = 0;
 			while ((line = reader.readLine()) != null)
 			{
 				String [] row = line.split(WHITESPACE_PATTERN);
 				String doc_id = row[0];
-				long num_words = Long.parseLong(row[0]);
-				globalNumWords += num_words;
+				long num_words = Long.parseLong(row[1]);
+				sumWords += num_words;
 
 				numWordsInDoc.put(doc_id, num_words);
 			}
 
+
 			// prumerna delka dokumentu v poctu slov
-			avdl = globalNumWords / N;
+			avdl = sumWords / N;
+			System.out.println("sumWords=" + sumWords + ", N=" + N);
 
 			reader.close();
+
+			// TEST
+			System.out.println("Reading docinfo...done.");
 		}
 		catch (Exception e)
 		{
@@ -191,6 +215,8 @@ final class Example {
 	private static void readVocab(String filename) {
 
 		vocabulary = new HashMap<>();
+
+		System.out.println("Reading vocab...");
 		try
 		{
 			BufferedReader reader = new BufferedReader(new FileReader(filename));
@@ -204,6 +230,10 @@ final class Example {
 				vocabulary.put(row[0], word_id++ + "");
 			}
 			reader.close();
+
+			// TEST
+			System.out.println("Reading vocab...done.");
+
 		}
 		catch (Exception e)
 		{
