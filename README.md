@@ -22,4 +22,3 @@ STEP 6: Run the client
 java -jar HBaseClient-jar-with-dependencies.jar -auth_conf PATH/TO/jaas.conf -async_conf PATH/TO/asynchbase.properties -table "marekp11:wiki_index" -vocab /PATH/TO/marekp11_task2.txt -docinfo /PATH/TO/marekp11_docinfo.txt
 ```
 
-// TODO zkusit jestli neni treba export hbase classpath
